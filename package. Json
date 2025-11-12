@@ -1,0 +1,18 @@
+{
+  "name": "awoofpoint-backend",
+  "version": "1.0.0",
+  "description": "Backend API for Awoof Point VTU web app",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "body-parser": "^1.20.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "axios": "^1.7.2",
+    "google-spreadsheet": "^4.1.1",
+    "paystack-api": "^2.0.2"
+  }
+}
