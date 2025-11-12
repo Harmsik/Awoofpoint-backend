@@ -1,0 +1,439 @@
+/**
+ * server.js - Awoof Point backend (CommonJS)
+ *
+ * - Google Sheets (Users, Orders, Transactions)
+ * - Auth (register/login), JWT tokens
+ * - Orders (deduct wallet), Transactions log
+ * - Paystack integration: initialize payment + webhook to credit wallet
+ *
+ * You MUST place your Google service account JSON file in project root with the filename:
+ *   absolute-hub-477905-b4-92fe93d5964e.json
+ *
+ * The Google Sheet ID is embedded below (from your link).
+ *
+ * PAYSTACK SECRET KEY is embedded below (you provided it). Treat it as sensitive.
+ *
+ * Install dependencies:
+ *   npm init -y
+ *   npm install express body-parser cors bcryptjs jsonwebtoken googleapis google-auth-library uuid axios dotenv crypto
+ *
+ * Run:
+ *   node server.js
+ *
+ * Note: set environment variables via .env if you want to override values.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const express = require('express');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { google } = require('googleapis');
+const { OAuth2Client } = require('google-auth-library');
+const { v4: uuidv4 } = require('uuid');
+const axios = require('axios');
+const crypto = require('crypto');
+require('dotenv').config();
+
+// ---------- CONFIG: you provided these ----------
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'change_this_jwt_secret_now';
+const SERVICE_ACCOUNT_FILE = process.env.GOOGLE_SA_FILE || 'absolute-hub-477905-b4-92fe93d5964e.json';
+const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID || '1PGk2RtTP-RTk2YMnVn8s3z4lw1s3biWaG-yUazvmHRg';
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || ''; // optional: set if you have one
+// Paystack secret (you provided)
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY || 'sk_test_236714a2be5972427835992feed049ba4c61f88d';
+
+// Sheet tab names
+const SHEET_USERS = 'Users';
+const SHEET_ORDERS = 'Orders';
+const SHEET_TX = 'Transactions';
+
+// ---------- Load service account JSON ----------
+const saPath = path.join(process.cwd(), SERVICE_ACCOUNT_FILE);
+let saCreds = null;
+if (fs.existsSync(saPath)) {
+  saCreds = JSON.parse(fs.readFileSync(saPath, 'utf8'));
+  console.log('Loaded service account:', SERVICE_ACCOUNT_FILE);
+} else {
+  console.error('Service account file not found at', saPath);
+  console.error('Place your JSON key (downloaded from Google Cloud) in project root with that filename.');
+  process.exit(1);
+}
+
+// ---------- Google Sheets auth ----------
+const jwtClient = new google.auth.JWT({
+  email: saCreds.client_email,
+  key: saCreds.private_key,
+  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+});
+const sheets = google.sheets({ version: 'v4', auth: jwtClient });
+const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID || '');
+
+// Ensure authorization (attempt)
+async function sheetsAuthorize() {
+  try {
+    await jwtClient.authorize();
+    console.log('Google Sheets auth OK');
+  } catch (err) {
+    console.error('Google Sheets auth failed:', err);
+    // continue; calls will fail until issue fixed
+  }
+}
+sheetsAuthorize();
+
+// ---------- Sheets helpers ----------
+async function getRows(sheetName) {
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `${sheetName}!A2:Z`,
+  });
+  return resp.data.values || [];
+}
+async function appendRow(sheetName, rowArray) {
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: `${sheetName}!A:Z`,
+    valueInputOption: 'RAW',
+    requestBody: { values: [rowArray] },
+  });
+}
+async function updateRange(sheetRange, values2D) {
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: GOOGLE_SHEET_ID,
+    range: sheetRange,
+    valueInputOption: 'RAW',
+    requestBody: { values: values2D }
+  });
+}
+
+// Users helpers
+async function getUsers() {
+  const rows = await getRows(SHEET_USERS);
+  // columns: id | name | phone | email | passwordHash | balance | last_transaction | createdAt
+  return rows.map((r, idx) => ({
+    sheetRow: 2 + idx,
+    id: r[0],
+    name: r[1],
+    phone: r[2],
+    email: r[3],
+    passwordHash: r[4],
+    balance: Number(r[5] || 0),
+    last_transaction: r[6] || '',
+    createdAt: r[7] || ''
+  }));
+}
+async function findUserByIdentifier(identifier) {
+  if (!identifier) return null;
+  const users = await getUsers();
+  const lower = identifier.toString().toLowerCase();
+  return users.find(u =>
+    (u.phone && u.phone.toLowerCase() === lower) ||
+    (u.email && u.email.toLowerCase() === lower)
+  );
+}
+async function findUserById(userId) {
+  const users = await getUsers();
+  return users.find(u => u.id === userId);
+}
+async function updateUserBalanceAndLastTx(rowNumber, newBalance, lastTx) {
+  // F = balance (6th column), G = last_transaction (7th column)
+  const range = `${SHEET_USERS}!F${rowNumber}:G${rowNumber}`;
+  await updateRange(range, [[String(newBalance), lastTx || '']]);
+}
+
+// ---------- Express app ----------
+const app = express();
+app.use(cors());
+app.use(bodyParser.json({ limit: '1mb' }));
+
+// health
+app.get('/health', (req, res) => res.json({ ok: true, now: new Date().toISOString() }));
+
+// ---------- Auth / JWT ----------
+function generateToken(user) {
+  return jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
+}
+async function authMiddleware(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ message: 'Missing token' });
+  const token = auth.split(' ')[1];
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    const user = await findUserById(payload.userId);
+    if (!user) return res.status(401).json({ message: 'Invalid token' });
+    req.user = user;
+    next();
+  } catch (err) {
+    return res.status(401).json({ message: 'Invalid token' });
+  }
+}
+
+// ---------- Register ----------
+app.post('/api/register', async (req, res) => {
+  try {
+    const { name, phone, email, password } = req.body;
+    if (!name || !phone || !password) return res.status(400).json({ message: 'name, phone and password required' });
+    const existing = await findUserByIdentifier((phone || '').toLowerCase());
+    if (existing) return res.status(400).json({ message: 'User with that phone/email already exists' });
+
+    const id = uuidv4();
+    const passHash = await bcrypt.hash(password, 10);
+    const balance = 0;
+    const last_transaction = '';
+    const createdAt = new Date().toISOString();
+
+    await appendRow(SHEET_USERS, [id, name, phone, email || '', passHash, String(balance), last_transaction, createdAt]);
+
+    const user = { id, name, phone, email: email || '', balance, last_transaction, createdAt };
+    const token = generateToken(user);
+    return res.json({ token, user });
+  } catch (err) {
+    console.error('register error', err);
+    return res.status(500).json({ message: 'Server error during register' });
+  }
+});
+
+// ---------- Login ----------
+app.post('/api/login', async (req, res) => {
+  try {
+    const { identifier, password } = req.body;
+    if (!identifier || !password) return res.status(400).json({ message: 'identifier and password required' });
+    const user = await findUserByIdentifier(identifier);
+    if (!user) return res.status(400).json({ message: 'Invalid credentials' });
+    if (!user.passwordHash) return res.status(400).json({ message: 'User has no local password. Use Google sign-in.' });
+    const ok = await bcrypt.compare(password, user.passwordHash);
+    if (!ok) return res.status(400).json({ message: 'Invalid credentials' });
+    const safe = { id: user.id, name: user.name, phone: user.phone, email: user.email, balance: user.balance, last_transaction: user.last_transaction, createdAt: user.createdAt };
+    const token = generateToken(safe);
+    return res.json({ token, user: safe });
+  } catch (err) {
+    console.error('login error', err);
+    return res.status(500).json({ message: 'Server error during login' });
+  }
+});
+
+// ---------- Google Sign-In (verify id_token) ----------
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { id_token } = req.body;
+    if (!id_token) return res.status(400).json({ message: 'id_token required' });
+
+    // verify id_token if GOOGLE_CLIENT_ID set
+    let payload;
+    if (GOOGLE_CLIENT_ID) {
+      const ticket = await googleClient.verifyIdToken({ idToken: id_token, audience: GOOGLE_CLIENT_ID });
+      payload = ticket.getPayload();
+    } else {
+      // if no client id provided, try to decode (less secure)
+      const ticket = await googleClient.verifyIdToken({ idToken: id_token, audience: [] }).catch(()=>null);
+      payload = ticket ? ticket.getPayload() : null;
+      if(!payload) return res.status(400).json({ message: 'Google verification failed (set GOOGLE_CLIENT_ID in .env)' });
+    }
+
+    const email = payload.email;
+    const name = payload.name || '';
+
+    let user = null;
+    if (email) user = await findUserByIdentifier(email.toLowerCase());
+    if (!user) {
+      // create new user (no password)
+      const id = uuidv4();
+      const passHash = '';
+      const balance = 0;
+      const last_transaction = '';
+      const createdAt = new Date().toISOString();
+      await appendRow(SHEET_USERS, [id, name, '', email || '', passHash, String(balance), last_transaction, createdAt]);
+      user = { id, name, phone: '', email: email || '', balance, last_transaction, createdAt };
+    } else {
+      user = { id: user.id, name: user.name, phone: user.phone, email: user.email, balance: user.balance, last_transaction: user.last_transaction, createdAt: user.createdAt };
+    }
+
+    const token = generateToken(user);
+    return res.json({ token, user });
+  } catch (err) {
+    console.error('google auth error', err);
+    return res.status(500).json({ message: 'Google auth failed', error: err?.toString?.() });
+  }
+});
+
+// ---------- GET /api/user ----------
+app.get('/api/user', authMiddleware, async (req, res) => {
+  const u = req.user;
+  return res.json({
+    user: {
+      id: u.id, name: u.name, phone: u.phone, email: u.email,
+      balance: u.balance, last_transaction: u.last_transaction, createdAt: u.createdAt
+    }
+  });
+});
+
+// ---------- GET /api/transactions ----------
+app.get('/api/transactions', authMiddleware, async (req, res) => {
+  try {
+    const limit = Number(req.query.limit || 6);
+    const rows = await getRows(SHEET_TX); // id, userId, type, amount, note, createdAt
+    const txs = rows
+      .map(r => ({ id: r[0], userId: r[1], type: r[2], amount: Number(r[3] || 0), note: r[4], createdAt: r[5] }))
+      .filter(t => t.userId === req.user.id)
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .slice(0, limit);
+    return res.json({ transactions: txs });
+  } catch (err) {
+    console.error('transactions error', err);
+    return res.status(500).json({ message: 'Failed to load transactions' });
+  }
+});
+
+// ---------- POST /api/orders ----------
+app.post('/api/orders', authMiddleware, async (req, res) => {
+  try {
+    const { service, network, plan, phone, amount } = req.body;
+    if (!service || !phone || !amount) return res.status(400).json({ message: 'service, phone and amount required' });
+
+    const numericAmount = Number(amount);
+    if (isNaN(numericAmount) || numericAmount <= 0) return res.status(400).json({ message: 'Invalid amount' });
+
+    const user = await findUserById(req.user.id);
+    if (!user) return res.status(400).json({ message: 'User not found' });
+
+    if (user.balance < numericAmount) return res.status(400).json({ message: 'Insufficient balance. Please top up your wallet.' });
+
+    const orderId = uuidv4();
+    const status = 'pending';
+    const createdAt = new Date().toISOString();
+    await appendRow(SHEET_ORDERS, [orderId, user.id, service, network || '', plan || '', phone, String(numericAmount), status, createdAt]);
+
+    // deduct
+    const newBalance = parseFloat((user.balance - numericAmount).toFixed(2));
+    const lastTxText = `Order ${orderId} (${service})`;
+    await updateUserBalanceAndLastTx(user.sheetRow, newBalance, lastTxText);
+
+    // add tx
+    const txId = uuidv4();
+    await appendRow(SHEET_TX, [txId, user.id, 'debit', String(numericAmount), `Order ${orderId} (${service})`, createdAt]);
+
+    const updatedUser = await findUserById(user.id);
+    return res.json({ success: true, order: { id: orderId, service, amount: numericAmount, status, createdAt }, user: { id: updatedUser.id, balance: updatedUser.balance, last_transaction: updatedUser.last_transaction } });
+  } catch (err) {
+    console.error('place order error', err);
+    return res.status(500).json({ message: 'Failed to place order' });
+  }
+});
+
+// ---------- POST /api/topup (unprotected - for testing) ----------
+app.post('/api/topup', async (req, res) => {
+  try {
+    const { userId, amount, note } = req.body;
+    if (!userId || amount == null) return res.status(400).json({ message: 'userId and amount required' });
+    const user = await findUserById(userId);
+    if (!user) return res.status(400).json({ message: 'User not found' });
+
+    const newBalance = parseFloat((user.balance + Number(amount)).toFixed(2));
+    const lastTxText = note || `Topup ${amount}`;
+    await updateUserBalanceAndLastTx(user.sheetRow, newBalance, lastTxText);
+
+    const txId = uuidv4();
+    const createdAt = new Date().toISOString();
+    await appendRow(SHEET_TX, [txId, userId, 'credit', String(amount), lastTxText, createdAt]);
+
+    return res.json({ success: true, newBalance });
+  } catch (err) {
+    console.error('topup error', err);
+    return res.status(500).json({ message: 'Failed to top up' });
+  }
+});
+
+/* -----------------------
+   PAYSTACK: initialize payment and webhook
+   ----------------------- */
+
+// Initialize a Paystack payment (returns authorization_url)
+app.post('/api/pay/initialize', authMiddleware, async (req, res) => {
+  try {
+    const { amount, email, metadata } = req.body;
+    // amount in kobo (lowest currency unit) for NGN
+    if (!amount || Number(amount) <= 0) return res.status(400).json({ message: 'Invalid amount' });
+
+    const kobo = Math.round(Number(amount) * 100);
+    // metadata can include userId, reason, orderId etc.
+    const payload = {
+      email: email || req.user.email || `${req.user.phone}@awoof.local`, // fallback email
+      amount: kobo,
+      metadata: Object.assign({ userId: req.user.id }, metadata || {})
+    };
+
+    const resp = await axios.post('https://api.paystack.co/transaction/initialize', payload, {
+      headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' }
+    });
+
+    // returns data.authorization_url and data.reference
+    return res.json(resp.data);
+  } catch (err) {
+    console.error('pay init error', err?.response?.data || err.toString());
+    return res.status(500).json({ message: 'Failed to initialize payment', detail: err?.response?.data || err.toString() });
+  }
+});
+
+// Paystack webhook endpoint
+// In Paystack dashboard set this URL e.g. https://yourdomain.com/api/pay/webhook
+// Ensure you set the Webhook to "Send raw body" and have the secret key to verify signature
+app.post('/api/pay/webhook', bodyParser.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    const signature = req.headers['x-paystack-signature'];
+    const body = req.body; // raw buffer
+    const computed = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(body).digest('hex');
+
+    if (signature !== computed) {
+      console.warn('Paystack webhook signature mismatch');
+      return res.status(400).send('signature mismatch');
+    }
+
+    const payload = JSON.parse(body.toString());
+    const event = payload.event;
+    const data = payload.data;
+
+    // Handle successful charge
+    if (event === 'charge.success' || event === 'charge.completed') {
+      // metadata.userId expected
+      const metadata = data.metadata || {};
+      const userId = metadata.userId;
+      const amountKobo = Number(data.amount || 0);
+      const amountNaira = amountKobo / 100;
+
+      if (userId) {
+        const user = await findUserById(userId);
+        if (user) {
+          const newBalance = parseFloat((user.balance + amountNaira).toFixed(2));
+          const lastTxText = `Paystack ${data.reference}`;
+          await updateUserBalanceAndLastTx(user.sheetRow, newBalance, lastTxText);
+
+          const txId = uuidv4();
+          const createdAt = new Date().toISOString();
+          await appendRow(SHEET_TX, [txId, userId, 'credit', String(amountNaira), `Paystack ${data.reference}`, createdAt]);
+
+          console.log(`Credited ${amountNaira} to ${userId} (ref: ${data.reference})`);
+        } else {
+          console.warn('Webhook: user not found for id', userId);
+        }
+      } else {
+        console.warn('Webhook: no userId in metadata:', metadata);
+      }
+    }
+
+    // respond 200 quickly
+    res.status(200).send('ok');
+  } catch (err) {
+    console.error('webhook handling error', err);
+    res.status(500).send('error');
+  }
+});
+
+/* ---- Start server ---- */
+app.listen(PORT, () => {
+  console.log(`Awoof Point backend running on port ${PORT}`);
+  console.log(`Google Sheet: ${GOOGLE_SHEET_ID}`);
+  console.log(`Expect service account file at: ${SERVICE_ACCOUNT_FILE}`);
+});
